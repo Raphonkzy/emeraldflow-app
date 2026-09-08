@@ -89,52 +89,42 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
   update-helm-manifest:
-    name: Update Helm Manifest
+    name: Update Helm Manifest (Pull Request)
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build-and-push-ecr
     runs-on: ubuntu-latest
+    env:
+      IMAGE_TAG: ${{ needs.build-and-push-ecr.outputs.image_tag }}
 
     steps:
-      - name: Install yq CLI (mikefarah/yq@v4.44.1)
-        run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
-          yq --version
+      - name: Checkout Helm Repository
+        uses: actions/checkout@v4
+        with:
+          repository: 'Raphonkzy/emeraldflow-helm'
+          token: ${{ secrets.HELM_REPO_ACCESS_TOKEN || secrets.GITOPS_PAT }}
+          path: helm-repo
 
-      - name: Clone Helm repository
-        env:
-          HELM_REPO_USER: ${{ secrets.HELM_REPO_USER }}
-          GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
-          HELM_REPOSITORY: ${{ vars.HELM_REPOSITORY }}
-        run: |
-          git clone "https://${HELM_REPO_USER}:${GITOPS_PAT}@github.com/${HELM_REPO_USER}/${HELM_REPOSITORY}.git" helm-repo
-
-      - name: Update image and tag in values.yaml
-        env:
-          ECR_REGISTRY: ${{ needs.build-and-push-ecr.outputs.ecr_registry }}
-          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ needs.build-and-push-ecr.outputs.image_tag }}
-        run: |
-          VALUES_FILE=$(find helm-repo -name "values.yaml" | head -n 1)
-          if [ -z "$VALUES_FILE" ]; then
-            echo "Error: values.yaml not found in Helm repository" >&2
-            exit 1
-          fi
-          echo "Updating values file: $VALUES_FILE"
-          yq -i ".app.image = \"${ECR_REGISTRY}/${ECR_REPOSITORY}\"" "$VALUES_FILE"
-          yq -i ".app.tag = \"${IMAGE_TAG}\"" "$VALUES_FILE"
-
-      - name: Commit and push changes to Helm repository
-        env:
-          IMAGE_TAG: ${{ needs.build-and-push-ecr.outputs.image_tag }}
+      - name: Update Image Tag in values.yaml
         run: |
           cd helm-repo
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --staged --quiet; then
-            echo "No changes in values.yaml to commit."
+          if [ -f "helm/emeraldflow/values.yaml" ]; then
+            sed -i "s/tag:.*/tag: \"${{ env.IMAGE_TAG }}\"/g" helm/emeraldflow/values.yaml
           else
-            git commit -m "ci: update image tag to ${IMAGE_TAG}"
-            git push origin main
+            VALUES_FILE=$(find . -name "values.yaml" | head -n 1)
+            sed -i "s/tag:.*/tag: \"${{ env.IMAGE_TAG }}\"/g" "$VALUES_FILE"
           fi
+
+      - name: Create Pull Request to Helm Repo
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.HELM_REPO_ACCESS_TOKEN || secrets.GITOPS_PAT }}
+          path: helm-repo
+          commit-message: "chore: update app image tag to ${{ env.IMAGE_TAG }}"
+          branch: "promote-image-${{ env.IMAGE_TAG }}"
+          title: "Promote App Image: ${{ env.IMAGE_TAG }}"
+          body: |
+            Automated PR triggered by Application CI.
+            - New Image Tag: `${{ env.IMAGE_TAG }}`
+            - Target: Helm values.yaml
+            Please review and merge to trigger Argo CD deployment.
+          base: main
