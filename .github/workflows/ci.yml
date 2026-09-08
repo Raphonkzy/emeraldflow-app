@@ -1,0 +1,140 @@
+name: CI/CD Pipeline
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+jobs:
+  test-and-sonar:
+    name: Unit Tests & SonarQube Scan
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest pytest-cov
+
+      - name: Run unit tests with coverage
+        run: |
+          pytest --cov=app --cov-report=xml:coverage.xml tests/
+
+      - name: Run SonarQube Scanner
+        uses: sonarsource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      - name: SonarQube Quality Gate Check
+        uses: sonarsource/sonarqube-quality-gate-action@v1.1.0
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+  build-and-push-ecr:
+    name: Build & Push to Amazon ECR
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+      image_tag: ${{ steps.set-tag.outputs.image_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: set-tag
+        run: echo "image_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            -f Dockerfiles/app/multistage/Dockerfile .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+  update-helm-manifest:
+    name: Update Helm Manifest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-and-push-ecr
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install yq CLI (mikefarah/yq@v4.44.1)
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Clone Helm repository
+        env:
+          HELM_REPO_USER: ${{ secrets.HELM_REPO_USER }}
+          GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
+          HELM_REPOSITORY: ${{ vars.HELM_REPOSITORY }}
+        run: |
+          git clone "https://${HELM_REPO_USER}:${GITOPS_PAT}@github.com/${HELM_REPO_USER}/${HELM_REPOSITORY}.git" helm-repo
+
+      - name: Update image and tag in values.yaml
+        env:
+          ECR_REGISTRY: ${{ needs.build-and-push-ecr.outputs.ecr_registry }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ needs.build-and-push-ecr.outputs.image_tag }}
+        run: |
+          VALUES_FILE=$(find helm-repo -name "values.yaml" | head -n 1)
+          if [ -z "$VALUES_FILE" ]; then
+            echo "Error: values.yaml not found in Helm repository" >&2
+            exit 1
+          fi
+          echo "Updating values file: $VALUES_FILE"
+          yq -i ".app.image = \"${ECR_REGISTRY}/${ECR_REPOSITORY}\"" "$VALUES_FILE"
+          yq -i ".app.tag = \"${IMAGE_TAG}\"" "$VALUES_FILE"
+
+      - name: Commit and push changes to Helm repository
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push-ecr.outputs.image_tag }}
+        run: |
+          cd helm-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes in values.yaml to commit."
+          else
+            git commit -m "ci: update image tag to ${IMAGE_TAG}"
+            git push origin main
+          fi
