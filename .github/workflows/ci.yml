@@ -1,13 +1,13 @@
 name: CI/CD Pipeline
 
 on:
-  pull_request:
-    branches:
-      - main
-  push:
-    branches:
-      - main
   workflow_dispatch:
+  # pull_request:
+  #   branches:
+  #     - main
+  # push:
+  #   branches:
+  #     - main
 
 jobs:
   test-and-sonar:
@@ -101,7 +101,7 @@ jobs:
       - name: Checkout Helm Repository
         uses: actions/checkout@v4
         with:
-          repository: 'Raphonkzy/emeraldflow-helm'
+          repository: "Raphonkzy/emeraldflow-helm"
           token: ${{ secrets.HELM_REPO_ACCESS_TOKEN || secrets.GITOPS_PAT }}
           path: helm-repo
 
